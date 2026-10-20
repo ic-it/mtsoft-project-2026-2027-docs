@@ -1,0 +1,5 @@
+# Compiled outputs, not the retained reference PDF.
+/MTSOFT.pdf
+/build/
+.DS_Store
+__pycache__/
