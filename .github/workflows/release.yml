@@ -1,0 +1,96 @@
+# Copy the CONTENTS of typst/ to the new repository root, including .github/.
+name: Build and release PDF
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TYPST_VERSION: "0.15.1"
+  # Official Windows x64 archive: https://github.com/typst/typst/releases/tag/v0.15.1
+  TYPST_ARCHIVE_SHA256: "19ce3551153c2fe7ee9fa2f95208310c8f4d3209fedb699e0333faf8913f6736"
+
+jobs:
+  release:
+    # Deleting a branch/tag is also a push event, but is not a document revision.
+    if: github.event_name != 'push' || github.event.deleted != true
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Typst
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "typst.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "typst"
+          $url = "https://github.com/typst/typst/releases/download/v$env:TYPST_VERSION/typst-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash
+          if ($actual -ne $env:TYPST_ARCHIVE_SHA256) {
+            throw "Typst archive checksum mismatch; refusing to execute it."
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $compiler = Get-ChildItem $destination -Filter typst.exe -Recurse
+          if (@($compiler).Count -ne 1) { throw "Expected exactly one Typst executable." }
+          $version = & $compiler.FullName --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch "^typst $([regex]::Escape($env:TYPST_VERSION))(\s|$)") {
+            throw "Unexpected Typst version: $version"
+          }
+          Write-Output $version
+          $compiler.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Require Times New Roman
+        run: |
+          $fontDirectory = Join-Path $env:WINDIR "Fonts"
+          foreach ($font in @("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf")) {
+            if (-not (Test-Path (Join-Path $fontDirectory $font))) {
+              throw "Times New Roman font missing: $font. Refusing a silent font substitution."
+            }
+          }
+          $families = typst fonts --font-path $fontDirectory --ignore-system-fonts
+          if ($LASTEXITCODE -ne 0 -or $families -notcontains "Times New Roman") {
+            throw "Typst cannot find the Times New Roman font family."
+          }
+
+      - name: Compile the document
+        run: |
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          typst compile --root . --font-path "$env:WINDIR\Fonts" --ignore-system-fonts main.typ build/MTSOFT.pdf
+          if ($LASTEXITCODE -ne 0) { throw "Typst compilation failed; no release will be published." }
+          if (-not (Test-Path build/MTSOFT.pdf) -or (Get-Item build/MTSOFT.pdf).Length -eq 0) {
+            throw "The compiled PDF is missing or empty."
+          }
+
+      - name: Publish a new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BUILD_REF: ${{ github.ref }}
+          BUILD_REF_NAME: ${{ github.ref_name }}
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
+          $tag = "build-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$shortSha"
+          $title = "PDF #$env:GITHUB_RUN_NUMBER - $env:BUILD_REF_NAME - $shortSha"
+          $latest = "false"
+          if ($env:BUILD_REF -eq "refs/heads/$env:DEFAULT_BRANCH") {
+            $branch = [uri]::EscapeDataString($env:DEFAULT_BRANCH)
+            $currentHead = gh api "repos/$env:GH_REPO/commits/$branch" --jq .sha
+            if ($LASTEXITCODE -ne 0) { throw "Cannot check the current default-branch revision." }
+            if ($currentHead -eq $env:GITHUB_SHA) { $latest = "true" }
+          }
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID"
+          $notes = "Automatically compiled PDF.`n`nRef: $env:BUILD_REF`nCommit: $env:GITHUB_SHA`nTypst: $env:TYPST_VERSION`nBuild: $runUrl"
+          gh release create $tag build/MTSOFT.pdf --target $env:GITHUB_SHA --title $title --notes $notes "--latest=$latest"
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed." }
